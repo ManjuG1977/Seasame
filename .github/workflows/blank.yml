@@ -80,6 +80,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       environment: ${{ steps.version.outputs.environment }}
       docker_tag: ${{ steps.version.outputs.docker_tag }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
     
     steps:
       - name: Checkout code
@@ -87,6 +88,12 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: sha
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
 
       - name: Determine environment from branch
         id: branch-env
@@ -119,7 +126,14 @@ jobs:
           echo "Latest tag: $LATEST_TAG"
           
           # Parse version
-          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST_TAG#v}"
+          # Remove 'v' prefix if present
+          CLEAN_TAG=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_TAG"
+          
+          # Set defaults if parsing failed
+          MAJOR=${MAJOR:-1}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
           
           # Increment based on branch
           if [[ "${{ github.ref_name }}" == "main" ]]; then
@@ -140,11 +154,13 @@ jobs:
           fi
           
           VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          DOCKER_TAG="${{ steps.branch-env.outputs.env_short }}-v${VERSION}-${{ github.sha::7 }}"
+          SHORT_SHA="${{ steps.sha.outputs.short_sha }}"
+          DOCKER_TAG="${{ steps.branch-env.outputs.env_short }}-v${VERSION}-${SHORT_SHA}"
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "environment=${{ steps.branch-env.outputs.environment }}" >> $GITHUB_OUTPUT
           echo "docker_tag=$DOCKER_TAG" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           
           # Create git tag
           git config user.name "github-actions"
@@ -160,6 +176,7 @@ jobs:
             "docker_tag": "$DOCKER_TAG",
             "branch": "${{ github.ref_name }}",
             "commit": "${{ github.sha }}",
+            "short_sha": "$SHORT_SHA",
             "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           }
           EOF
