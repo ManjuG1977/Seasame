@@ -5,35 +5,34 @@ on:
     branches:
       - develop
       - qa
-      - uat
-      - main
+      - uat     
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
       - develop
       - qa
-      - uat
-      - main
+      - uat   
 
 env:
   AZURE_CONTAINER_REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
-  IMAGE_NAME: frontend-app  # or backend-app depending on repo
+  IMAGE_NAME: frontend-app
   DOCKERFILE_PATH: ./Dockerfile
   CONTEXT_PATH: .
+  DEPLOYMENT_PATH: /apps/ddc/frontend
+  COMPOSE_FILE: docker-compose.yml
 
 jobs:
   # ==============================================
-  # JOB 1: SonarCloud Scan (Matrix for multi-service)
+  # JOB 1: SonarCloud Scan
   # ==============================================
   sonarcloud-scan:
     name: SonarCloud_Scan
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     
-    # If you have both frontend/backend in same repo, use matrix
     strategy:
       matrix:
-        service: [frontend]  # Change to [frontend, backend] if both in same repo
+        service: [frontend]
       fail-fast: false
     
     steps:
@@ -103,18 +102,22 @@ jobs:
             develop)
               echo "environment=dev" >> $GITHUB_OUTPUT
               echo "env_short=dev" >> $GITHUB_OUTPUT
+              echo "vm_name=dev-vm" >> $GITHUB_OUTPUT
               ;;
             qa)
               echo "environment=qa" >> $GITHUB_OUTPUT
               echo "env_short=qa" >> $GITHUB_OUTPUT
+              echo "vm_name=qa-vm" >> $GITHUB_OUTPUT
               ;;
             uat)
               echo "environment=uat" >> $GITHUB_OUTPUT
               echo "env_short=uat" >> $GITHUB_OUTPUT
+              echo "vm_name=uat-vm" >> $GITHUB_OUTPUT
               ;;
             main)
               echo "environment=prod" >> $GITHUB_OUTPUT
               echo "env_short=prod" >> $GITHUB_OUTPUT
+              echo "vm_name=prod-vm" >> $GITHUB_OUTPUT
               ;;
           esac
 
@@ -126,7 +129,6 @@ jobs:
           echo "Latest tag: $LATEST_TAG"
           
           # Parse version
-          # Remove 'v' prefix if present
           CLEAN_TAG=${LATEST_TAG#v}
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_TAG"
           
@@ -137,19 +139,15 @@ jobs:
           
           # Increment based on branch
           if [[ "${{ github.ref_name }}" == "main" ]]; then
-            # Production: Major increment
             MAJOR=$((MAJOR + 1))
             MINOR=0
             PATCH=0
           elif [[ "${{ github.ref_name }}" == "uat" ]]; then
-            # UAT: Minor increment
             MINOR=$((MINOR + 1))
             PATCH=0
           elif [[ "${{ github.ref_name }}" == "qa" ]]; then
-            # QA: Patch increment
             PATCH=$((PATCH + 1))
           else
-            # Develop: Use run number for patch
             PATCH=${{ github.run_number }}
           fi
           
@@ -161,6 +159,7 @@ jobs:
           echo "environment=${{ steps.branch-env.outputs.environment }}" >> $GITHUB_OUTPUT
           echo "docker_tag=$DOCKER_TAG" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "vm_name=${{ steps.branch-env.outputs.vm_name }}" >> $GITHUB_OUTPUT
           
           # Create git tag
           git config user.name "github-actions"
@@ -177,6 +176,7 @@ jobs:
             "branch": "${{ github.ref_name }}",
             "commit": "${{ github.sha }}",
             "short_sha": "$SHORT_SHA",
+            "vm_name": "${{ steps.branch-env.outputs.vm_name }}",
             "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           }
           EOF
@@ -274,7 +274,7 @@ jobs:
   deploy-dev:
     name: Deploy_Dev
     runs-on: ubuntu-latest
-    needs: build-docker
+    needs: [build-docker, generate-version]
     if: github.ref == 'refs/heads/develop'
     environment:
       name: development
@@ -286,51 +286,60 @@ jobs:
         with:
           name: image-metadata
 
-      - name: Read image info
-        id: image
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info
+
+      - name: Read deployment info
+        id: info
         run: |
           METADATA=$(cat image-metadata.json)
+          VERSION_JSON=$(cat version.json)
           echo "image=$(echo $METADATA | jq -r .image)" >> $GITHUB_OUTPUT
           echo "version=$(echo $METADATA | jq -r .version)" >> $GITHUB_OUTPUT
           echo "docker_tag=$(echo $METADATA | jq -r .docker_tag)" >> $GITHUB_OUTPUT
+          echo "vm_name=$(echo $VERSION_JSON | jq -r .vm_name)" >> $GITHUB_OUTPUT
 
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
 
-      - name: Deploy to Dev App Service
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: ${{ secrets.DEV_APP_NAME }}
-          images: ${{ steps.image.outputs.image }}
-          slot-name: production
+      - name: Add VM to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VM_HOST_DEV }} >> ~/.ssh/known_hosts
 
-      - name: Configure App Settings
-        uses: azure/app-service-settings@v1
-        with:
-          app-name: ${{ secrets.DEV_APP_NAME }}
-          settings: |
-            [
-              {
-                "name": "VERSION",
-                "value": "${{ steps.image.outputs.version }}"
-              },
-              {
-                "name": "ENVIRONMENT",
-                "value": "development"
-              },
-              {
-                "name": "DOCKER_TAG",
-                "value": "${{ steps.image.outputs.docker_tag }}"
-              }
-            ]
+      - name: Deploy to Dev VM
+        run: |
+          # Create deployment directory if it doesn't exist
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "sudo mkdir -p ${{ env.DEPLOYMENT_PATH }} && sudo chown -R $USER:$USER ${{ env.DEPLOYMENT_PATH }}"
+          
+          # Copy docker-compose file
+          scp ${{ env.COMPOSE_FILE }} ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }}:${{ env.DEPLOYMENT_PATH }}/
+          
+          # Login to ACR on VM
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "echo ${{ secrets.ACR_PASSWORD }} | docker login ${{ secrets.ACR_LOGIN_SERVER }} -u ${{ secrets.ACR_USERNAME }} --password-stdin"
+          
+          # Pull latest image
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "docker pull ${{ steps.info.outputs.image }}"
+          
+          # Update docker-compose with new image and restart
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "cd ${{ env.DEPLOYMENT_PATH }} && \
+            export IMAGE=${{ steps.info.outputs.image }} && \
+            export VERSION=${{ steps.info.outputs.version }} && \
+            docker-compose down && \
+            docker-compose up -d"
+          
+          # Clean up old images
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "docker image prune -f"
 
       - name: Verify deployment
         run: |
           sleep 30
-          curl -f https://dev.domain.com/health || echo "Health check failed"
-          curl -f https://dev.domain.com/version || echo "Version endpoint check failed"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_DEV }} "curl -f http://localhost:3000/health || exit 1"
+          echo "Dev deployment verified"
 
   # ==============================================
   # JOB 5: Deploy to QA (qa branch)
@@ -338,7 +347,7 @@ jobs:
   deploy-qa:
     name: Deploy_QA
     runs-on: ubuntu-latest
-    needs: build-docker
+    needs: [build-docker, generate-version]
     if: github.ref == 'refs/heads/qa'
     environment:
       name: qa
@@ -350,54 +359,57 @@ jobs:
         with:
           name: image-metadata
 
-      - name: Read image info
-        id: image
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info
+
+      - name: Read deployment info
+        id: info
         run: |
           METADATA=$(cat image-metadata.json)
+          VERSION_JSON=$(cat version.json)
           echo "image=$(echo $METADATA | jq -r .image)" >> $GITHUB_OUTPUT
           echo "version=$(echo $METADATA | jq -r .version)" >> $GITHUB_OUTPUT
+          echo "docker_tag=$(echo $METADATA | jq -r .docker_tag)" >> $GITHUB_OUTPUT
 
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
 
-      - name: Deploy to QA App Service
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: ${{ secrets.QA_APP_NAME }}
-          images: ${{ steps.image.outputs.image }}
-          slot-name: production
+      - name: Add VM to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VM_HOST_QA }} >> ~/.ssh/known_hosts
 
-      - name: Configure App Settings
-        uses: azure/app-service-settings@v1
-        with:
-          app-name: ${{ secrets.QA_APP_NAME }}
-          settings: |
-            [
-              {
-                "name": "VERSION",
-                "value": "${{ steps.image.outputs.version }}"
-              },
-              {
-                "name": "ENVIRONMENT",
-                "value": "qa"
-              }
-            ]
+      - name: Deploy to QA VM
+        run: |
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "sudo mkdir -p ${{ env.DEPLOYMENT_PATH }} && sudo chown -R $USER:$USER ${{ env.DEPLOYMENT_PATH }}"
+          scp ${{ env.COMPOSE_FILE }} ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }}:${{ env.DEPLOYMENT_PATH }}/
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "echo ${{ secrets.ACR_PASSWORD }} | docker login ${{ secrets.ACR_LOGIN_SERVER }} -u ${{ secrets.ACR_USERNAME }} --password-stdin"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "docker pull ${{ steps.info.outputs.image }}"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "cd ${{ env.DEPLOYMENT_PATH }} && \
+            export IMAGE=${{ steps.info.outputs.image }} && \
+            export VERSION=${{ steps.info.outputs.version }} && \
+            docker-compose down && \
+            docker-compose up -d"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "docker image prune -f"
 
       - name: Run QA smoke tests
         run: |
-          echo "Running QA smoke tests..."
-          curl -f https://qa.domain.com/api/health
-          curl -f https://qa.domain.com/health
+          sleep 30
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "curl -f http://localhost:3000/health || exit 1"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_QA }} "curl -f http://localhost:3000/version || exit 1"
+          echo "QA deployment verified"
 
   # ==============================================
   # JOB 6: Deploy to UAT (uat branch)
   # ==============================================
   deploy-uat:
-    name: Deploy_QAT
+    name: Deploy_UAT
     runs-on: ubuntu-latest
-    needs: build-docker
+    needs: [build-docker, generate-version]
     if: github.ref == 'refs/heads/uat'
     environment:
       name: uat
@@ -409,51 +421,76 @@ jobs:
         with:
           name: image-metadata
 
-      - name: Read image info
-        id: image
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info
+
+      - name: Read deployment info
+        id: info
         run: |
           METADATA=$(cat image-metadata.json)
+          VERSION_JSON=$(cat version.json)
           echo "image=$(echo $METADATA | jq -r .image)" >> $GITHUB_OUTPUT
           echo "version=$(echo $METADATA | jq -r .version)" >> $GITHUB_OUTPUT
 
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
 
-      - name: Deploy to UAT App Service
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: ${{ secrets.UAT_APP_NAME }}
-          images: ${{ steps.image.outputs.image }}
-          slot-name: production
+      - name: Add VM to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.VM_HOST_UAT }} >> ~/.ssh/known_hosts
 
-      - name: Configure App Settings
-        uses: azure/app-service-settings@v1
-        with:
-          app-name: ${{ secrets.UAT_APP_NAME }}
-          settings: |
-            [
-              {
-                "name": "VERSION",
-                "value": "${{ steps.image.outputs.version }}"
-              },
-              {
-                "name": "ENVIRONMENT",
-                "value": "uat"
-              }
-            ]
+      - name: Deploy to UAT VM
+        run: |
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "sudo mkdir -p ${{ env.DEPLOYMENT_PATH }} && sudo chown -R $USER:$USER ${{ env.DEPLOYMENT_PATH }}"
+          scp ${{ env.COMPOSE_FILE }} ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }}:${{ env.DEPLOYMENT_PATH }}/
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "echo ${{ secrets.ACR_PASSWORD }} | docker login ${{ secrets.ACR_LOGIN_SERVER }} -u ${{ secrets.ACR_USERNAME }} --password-stdin"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "docker pull ${{ steps.info.outputs.image }}"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "cd ${{ env.DEPLOYMENT_PATH }} && \
+            export IMAGE=${{ steps.info.outputs.image }} && \
+            export VERSION=${{ steps.info.outputs.version }} && \
+            docker-compose down && \
+            docker-compose up -d"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "docker image prune -f"
 
       - name: Run UAT validation tests
         run: |
-          echo "Running UAT validation suite..."
-          # Add your UAT test scripts here 
+          sleep 30
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "curl -f http://localhost:3000/health || exit 1"
+          ssh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST_UAT }} "curl -f http://localhost:3000/version || exit 1"
+          echo "UAT deployment verified"
+
+  
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.info.outputs.version }}
+          name: Release v${{ steps.info.outputs.version }}
+          body: |
+            ## Release v${{ steps.info.outputs.version }}
+            
+            **Environment:** Production
+            **Docker Image:** ${{ steps.info.outputs.image }}
+            **Deployed:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            **Commit:** ${{ github.sha }}
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==============================================
   # JOB 8: Send Notification
   # ==============================================
   send-notification:
-    name: 📧 Send Notification
+    name: Send_Notification
     runs-on: ubuntu-latest
     needs: [deploy-dev, deploy-qa, deploy-uat]
     if: always()
@@ -469,19 +506,19 @@ jobs:
         id: status
         run: |
           if [[ "${{ needs.deploy-uat.result }}" == "success" ]]; then
-            STATUS="Deployed UAT"
+            STATUS="Deployed_UAT"
             ENV="uat"
             URL="https://uat.domain.com"
           elif [[ "${{ needs.deploy-qa.result }}" == "success" ]]; then
-            STATUS="Deployed QA"
+            STATUS="Deployed_QA"
             ENV="qa"
             URL="https://qa.domain.com"
           elif [[ "${{ needs.deploy-dev.result }}" == "success" ]]; then
-            STATUS="Deployed Develop"
+            STATUS="Deployed_Dev"
             ENV="dev"
             URL="https://dev.domain.com"
           else
-            STATUS="❌ Failed"
+            STATUS="Failed"
             ENV="unknown"
             URL=""
           fi
@@ -518,7 +555,7 @@ jobs:
             **Commit:** ${{ github.sha }}
             **Actor:** ${{ github.actor }}
 
-      - name: Send Email (Optional)
+      - name: Send Email
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
