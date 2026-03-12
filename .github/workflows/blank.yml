@@ -26,7 +26,7 @@ jobs:
   # JOB 1: SonarCloud Scan (Matrix for multi-service)
   # ==============================================
   sonarcloud-scan:
-    name: 🔍 SonarCloud Scan
+    name: SonarCloud_Scan
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     
@@ -72,7 +72,7 @@ jobs:
   # JOB 2: Generate Version Tag
   # ==============================================
   generate-version:
-    name: 🏷️ Generate Version Tag
+    name: Semantic_Tag
     runs-on: ubuntu-latest
     needs: sonarcloud-scan
     if: github.event_name == 'push'
@@ -191,7 +191,7 @@ jobs:
   # JOB 3: Build and Push Docker Image
   # ==============================================
   build-docker:
-    name: 🐳 Build & Push Docker Image
+    name: Build_docker
     runs-on: ubuntu-latest
     needs: generate-version
     if: github.event_name == 'push'
@@ -272,13 +272,13 @@ jobs:
   # JOB 4: Deploy to Development (develop branch)
   # ==============================================
   deploy-dev:
-    name: 🚀 Deploy to Development
+    name: Deploy_Dev
     runs-on: ubuntu-latest
     needs: build-docker
     if: github.ref == 'refs/heads/develop'
     environment:
       name: development
-      url: https://dev.yourdomain.com
+      url: https://dev.domain.com
     
     steps:
       - name: Download image metadata
@@ -329,20 +329,20 @@ jobs:
       - name: Verify deployment
         run: |
           sleep 30
-          curl -f https://dev.yourdomain.com/health || echo "Health check failed"
-          curl -f https://dev.yourdomain.com/version || echo "Version endpoint check failed"
+          curl -f https://dev.domain.com/health || echo "Health check failed"
+          curl -f https://dev.domain.com/version || echo "Version endpoint check failed"
 
   # ==============================================
   # JOB 5: Deploy to QA (qa branch)
   # ==============================================
   deploy-qa:
-    name: 🚀 Deploy to QA
+    name: Deploy_QA
     runs-on: ubuntu-latest
     needs: build-docker
     if: github.ref == 'refs/heads/qa'
     environment:
       name: qa
-      url: https://qa.yourdomain.com
+      url: https://qa.domain.com
     
     steps:
       - name: Download image metadata
@@ -388,20 +388,20 @@ jobs:
       - name: Run QA smoke tests
         run: |
           echo "Running QA smoke tests..."
-          curl -f https://qa.yourdomain.com/api/health
-          curl -f https://qa.yourdomain.com/health
+          curl -f https://qa.domain.com/api/health
+          curl -f https://qa.domain.com/health
 
   # ==============================================
   # JOB 6: Deploy to UAT (uat branch)
   # ==============================================
   deploy-uat:
-    name: 🚀 Deploy to UAT
+    name: Deploy_QAT
     runs-on: ubuntu-latest
     needs: build-docker
     if: github.ref == 'refs/heads/uat'
     environment:
       name: uat
-      url: https://uat.yourdomain.com
+      url: https://uat.domain.com
     
     steps:
       - name: Download image metadata
@@ -447,96 +447,7 @@ jobs:
       - name: Run UAT validation tests
         run: |
           echo "Running UAT validation suite..."
-          # Add your UAT test scripts here
-
-  # ==============================================
-  # JOB 7: Deploy to Production (main branch)
-  # ==============================================
-  deploy-production:
-    name: 🚀 Deploy to Production
-    runs-on: ubuntu-latest
-    needs: build-docker
-    if: github.ref == 'refs/heads/main'
-    environment:
-      name: production
-      url: https://yourdomain.com
-    concurrency: production-deployment
-    
-    steps:
-      - name: Download image metadata
-        uses: actions/download-artifact@v3
-        with:
-          name: image-metadata
-
-      - name: Read image info
-        id: image
-        run: |
-          METADATA=$(cat image-metadata.json)
-          echo "image=$(echo $METADATA | jq -r .image)" >> $GITHUB_OUTPUT
-          echo "version=$(echo $METADATA | jq -r .version)" >> $GITHUB_OUTPUT
-
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy to Staging Slot
-        uses: azure/webapps-deploy@v2
-        with:
-          app-name: ${{ secrets.PROD_APP_NAME }}
-          images: ${{ steps.image.outputs.image }}
-          slot-name: staging
-
-      - name: Configure Staging Settings
-        uses: azure/app-service-settings@v1
-        with:
-          app-name: ${{ secrets.PROD_APP_NAME }}
-          slot-name: staging
-          settings: |
-            [
-              {
-                "name": "VERSION",
-                "value": "${{ steps.image.outputs.version }}"
-              },
-              {
-                "name": "ENVIRONMENT",
-                "value": "staging"
-              }
-            ]
-
-      - name: Run Smoke Tests on Staging
-        run: |
-          echo "Running smoke tests on staging..."
-          curl -f https://${{ secrets.PROD_APP_NAME }}-staging.azurewebsites.net/health
-          curl -f https://${{ secrets.PROD_APP_NAME }}-staging.azurewebsites.net/version
-
-      - name: Swap to Production
-        run: |
-          az webapp deployment slot swap \
-            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
-            --name ${{ secrets.PROD_APP_NAME }} \
-            --slot staging \
-            --target-slot production
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ steps.image.outputs.version }}
-          name: Release v${{ steps.image.outputs.version }}
-          body: |
-            ## Release v${{ steps.image.outputs.version }}
-            
-            **Environment:** Production
-            **Docker Image:** ${{ steps.image.outputs.image }}
-            **Deployed:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
-            **Commit:** ${{ github.sha }}
-            
-            ### Changes
-            ${{ github.event.head_commit.message }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Add your UAT test scripts here 
 
   # ==============================================
   # JOB 8: Send Notification
@@ -544,7 +455,7 @@ jobs:
   send-notification:
     name: 📧 Send Notification
     runs-on: ubuntu-latest
-    needs: [deploy-dev, deploy-qa, deploy-uat, deploy-production]
+    needs: [deploy-dev, deploy-qa, deploy-uat]
     if: always()
     
     steps:
@@ -557,22 +468,18 @@ jobs:
       - name: Determine deployment status
         id: status
         run: |
-          if [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
-            STATUS="✅ Production"
-            ENV="production"
-            URL="https://yourdomain.com"
-          elif [[ "${{ needs.deploy-uat.result }}" == "success" ]]; then
-            STATUS="✅ UAT"
+          if [[ "${{ needs.deploy-uat.result }}" == "success" ]]; then
+            STATUS="Deployed UAT"
             ENV="uat"
-            URL="https://uat.yourdomain.com"
+            URL="https://uat.domain.com"
           elif [[ "${{ needs.deploy-qa.result }}" == "success" ]]; then
-            STATUS="✅ QA"
+            STATUS="Deployed QA"
             ENV="qa"
-            URL="https://qa.yourdomain.com"
+            URL="https://qa.domain.com"
           elif [[ "${{ needs.deploy-dev.result }}" == "success" ]]; then
-            STATUS="✅ Development"
+            STATUS="Deployed Develop"
             ENV="dev"
-            URL="https://dev.yourdomain.com"
+            URL="https://dev.domain.com"
           else
             STATUS="❌ Failed"
             ENV="unknown"
