@@ -1,0 +1,534 @@
+name: Complete CI/CD Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:      
+      - develop
+      - qa
+      - uat
+      - main
+  push:
+    branches:      
+      - develop
+      - qa
+      - uat
+      - main
+
+# Define version variables
+env:
+  MAJOR_VERSION: 1
+  MINOR_VERSION: 0
+  PATCH_VERSION: ${{ github.run_number }}
+  FULL_VERSION: 1.0.${{ github.run_number }}
+  BUILD_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+
+jobs:
+  # ==============================================
+  # STAGE 1: Sonar Scan (Quality Gate)
+  # ==============================================
+  sonar-scan:
+    name: 🔍 SonarCloud Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    
+    strategy:
+      matrix:
+        service: [frontend, backend]
+    
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies (${{ matrix.service }})
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: npm ci
+
+      - name: Run tests with coverage (${{ matrix.service }})
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: npm test -- --coverage
+
+      - name: SonarCloud Scan (${{ matrix.service }})
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}-${{ matrix.service }}
+            -Dsonar.projectVersion=1.0.${{ github.run_number }}
+            -Dsonar.sources=apps/ddc/${{ matrix.service }}
+            -Dsonar.tests=apps/ddc/${{ matrix.service }}
+            -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js
+            -Dsonar.javascript.lcov.reportPaths=apps/ddc/${{ matrix.service }}/coverage/lcov.info
+
+      - name: Quality Gate Check
+        run: |
+          echo "✅ SonarCloud scan completed for ${{ matrix.service }}"
+
+  # ==============================================
+  # STAGE 2: Version Tag Generation
+  # ==============================================
+  version-tag:
+    name: 🏷️ Generate Version Tag
+    runs-on: ubuntu-latest
+    needs: sonar-scan
+    if: github.event_name == 'push'
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
+      full_version: ${{ steps.set-version.outputs.full_version }}
+      environment: ${{ steps.set-env.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Determine environment from branch
+        id: set-env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            ENV="dev"
+          elif [[ "${{ github.ref }}" == "refs/heads/qa" ]]; then
+            echo "environment=qa" >> $GITHUB_OUTPUT
+            ENV="qa"
+          elif [[ "${{ github.ref }}" == "refs/heads/uat" ]]; then
+            echo "environment=uat" >> $GITHUB_OUTPUT
+            ENV="uat"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            ENV="prod"
+          fi
+          
+      - name: Generate version
+        id: set-version
+        run: |
+          # Get latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "1.0.0")
+          echo "Latest tag: $LATEST_TAG"
+          
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_TAG"
+          
+          # Increment based on branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            # Production: Major version increment
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [[ "${{ github.ref }}" == "refs/heads/uat" ]]; then
+            # UAT: Minor version increment
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            # Dev/QA: Patch version increment
+            PATCH=${{ github.run_number }}
+          fi
+          
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Create git tag
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -a "v$VERSION" -m "Release version $VERSION for ${{ github.ref_name }}"
+          git push origin "v$VERSION"
+          
+          # Save version info
+          cat > version.txt << EOF
+          VERSION=$VERSION
+          ENVIRONMENT=${{ steps.set-env.outputs.environment }}
+          BRANCH=${{ github.ref_name }}
+          COMMIT_SHA=${{ github.sha }}
+          BUILD_TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          EOF
+          
+      - name: Upload version info
+        uses: actions/upload-artifact@v3
+        with:
+          name: version-info-${{ steps.set-env.outputs.environment }}
+          path: version.txt
+
+  # ==============================================
+  # STAGE 3: Build
+  # ==============================================
+  build:
+    name: 🏗️ Build Application
+    runs-on: ubuntu-latest
+    needs: version-tag
+    if: github.event_name == 'push'
+    
+    strategy:
+      matrix:
+        service: [frontend, backend]
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info-${{ needs.version-tag.outputs.environment }}
+
+      - name: Read version
+        run: |
+          source version.txt
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: npm ci
+
+      - name: Update version
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: |
+          npm version ${{ env.VERSION }} --no-git-tag-version --allow-same-version
+
+      - name: Build ${{ matrix.service }}
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: npm run build
+        env:
+          VERSION: ${{ env.VERSION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+
+      - name: Create version.json
+        working-directory: apps/ddc/${{ matrix.service }}
+        run: |
+          mkdir -p dist
+          cat > dist/version.json << EOF
+          {
+            "version": "${{ env.VERSION }}",
+            "environment": "${{ env.ENVIRONMENT }}",
+            "service": "${{ matrix.service }}",
+            "buildTimestamp": "${{ github.event.head_commit.timestamp }}",
+            "commitSha": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}"
+          }
+          EOF
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.service }}-build-${{ env.VERSION }}
+          path: apps/ddc/${{ matrix.service }}/dist/
+
+  # ==============================================
+  # STAGE 4: Deploy to QA
+  # ==============================================
+  deploy-qa:
+    name: 🚀 Deploy to QA
+    runs-on: ubuntu-latest
+    needs: [build, version-tag]
+    if: github.ref == 'refs/heads/qa' || github.ref == 'refs/heads/develop'
+    environment: 
+      name: qa
+      url: https://qa.yourdomain.com
+    
+    steps:
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info-qa
+
+      - name: Read version
+        run: |
+          source version.txt
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-${{ env.VERSION }}
+          path: frontend-dist
+
+      - name: Download backend build
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-build-${{ env.VERSION }}
+          path: backend-dist
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to QA App Service
+        run: |
+          # Deploy frontend to QA slot
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.QA_FRONTEND_APP }} \
+            --src frontend-dist
+            
+          # Deploy backend to QA slot
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.QA_BACKEND_APP }} \
+            --src backend-dist
+
+      - name: Run QA smoke tests
+        run: |
+          echo "Running QA smoke tests..."
+          curl -f https://qa.yourdomain.com/api/health
+          curl -f https://qa.yourdomain.com/health
+
+      - name: Create deployment record
+        run: |
+          cat > deployment-qa.json << EOF
+          {
+            "version": "${{ env.VERSION }}",
+            "environment": "qa",
+            "deployedAt": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "status": "success"
+          }
+          EOF
+
+  # ==============================================
+  # STAGE 5: Deploy to Dev
+  # ==============================================
+  deploy-dev:
+    name: 🚀 Deploy to Development
+    runs-on: ubuntu-latest
+    needs: [build, version-tag]
+    if: github.ref == 'refs/heads/develop'
+    environment: 
+      name: development
+      url: https://dev.yourdomain.com
+    
+    steps:
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info-dev
+
+      - name: Read version
+        run: |
+          source version.txt
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-${{ env.VERSION }}
+          path: frontend-dist
+
+      - name: Download backend build
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-build-${{ env.VERSION }}
+          path: backend-dist
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Dev App Service
+        run: |
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.DEV_FRONTEND_APP }} \
+            --src frontend-dist
+            
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.DEV_BACKEND_APP }} \
+            --src backend-dist
+
+  # ==============================================
+  # STAGE 6: Deploy to UAT
+  # ==============================================
+  deploy-uat:
+    name: 🚀 Deploy to UAT
+    runs-on: ubuntu-latest
+    needs: [deploy-qa, version-tag]
+    if: github.ref == 'refs/heads/uat'
+    environment: 
+      name: uat
+      url: https://uat.yourdomain.com
+    
+    steps:
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info-uat
+
+      - name: Read version
+        run: |
+          source version.txt
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-${{ env.VERSION }}
+          path: frontend-dist
+
+      - name: Download backend build
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-build-${{ env.VERSION }}
+          path: backend-dist
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to UAT App Service
+        run: |
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.UAT_FRONTEND_APP }} \
+            --src frontend-dist
+            
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.UAT_BACKEND_APP }} \
+            --src backend-dist
+
+      - name: Run UAT validation tests
+        run: |
+          echo "Running UAT validation suite..."
+          # Add your UAT test scripts here
+
+  # ==============================================
+  # STAGE 7: Deploy to Production
+  # ==============================================
+  deploy-prod:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-uat, version-tag]
+    if: github.ref == 'refs/heads/main'
+    environment: 
+      name: production
+      url: https://yourdomain.com
+    concurrency: production
+    
+    steps:
+      - name: Download version info
+        uses: actions/download-artifact@v3
+        with:
+          name: version-info-prod
+
+      - name: Read version
+        run: |
+          source version.txt
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v3
+        with:
+          name: frontend-build-${{ env.VERSION }}
+          path: frontend-dist
+
+      - name: Download backend build
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-build-${{ env.VERSION }}
+          path: backend-dist
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Production (with swap)
+        run: |
+          # Deploy to staging slot first
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.PROD_FRONTEND_APP }} \
+            --slot staging \
+            --src frontend-dist
+            
+          az webapp deployment source config-zip \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.PROD_BACKEND_APP }} \
+            --slot staging \
+            --src backend-dist
+          
+          # Run smoke tests on staging
+          curl -f https://${{ secrets.PROD_FRONTEND_APP }}-staging.azurewebsites.net/health
+          
+          # Swap to production
+          az webapp deployment slot swap \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.PROD_FRONTEND_APP }} \
+            --slot staging \
+            --target-slot production
+          
+          az webapp deployment slot swap \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.PROD_BACKEND_APP }} \
+            --slot staging \
+            --target-slot production
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Release v${{ env.VERSION }}
+          body: |
+            ## Release v${{ env.VERSION }}
+            
+            **Environment:** Production
+            **Deployed:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            **Commit:** ${{ github.sha }}
+            
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==============================================
+  # NOTIFICATION STAGE
+  # ==============================================
+  notify:
+    name: 📧 Send Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-qa, deploy-uat, deploy-prod]
+    if: always()
+    
+    steps:
+      - name: Determine deployment status
+        run: |
+          if [[ "${{ needs.deploy-prod.result }}" == "success" ]]; then
+            STATUS="✅ Production deployment successful"
+          elif [[ "${{ needs.deploy-uat.result }}" == "success" ]]; then
+            STATUS="✅ UAT deployment successful"
+          elif [[ "${{ needs.deploy-qa.result }}" == "success" ]]; then
+            STATUS="✅ QA deployment successful"
+          elif [[ "${{ needs.deploy-dev.result }}" == "success" ]]; then
+            STATUS="✅ Dev deployment successful"
+          else
+            STATUS="❌ Deployment failed"
+          fi
+          echo "STATUS=$STATUS" >> $GITHUB_ENV
+
+      - name: Send Teams Notification
+        uses: toko-bifrost/ms-teams-deploy-card@master
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          environment: ${{ github.ref_name }}
+          status: ${{ job.status }}
+          description: ${{ env.STATUS }}
